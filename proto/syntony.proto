@@ -1,0 +1,77 @@
+// Syntony wire protocol — the authoritative, language-neutral spec artifact
+// (§16.1). TypeScript codegen now; Go/Python ports follow this file, not the TS
+// source. Every 64-bit field is `uint64` and MUST be handled as a BigInt /
+// decimal string, never a JS number (§7.2, the float64 trap).
+syntax = "proto3";
+
+package syntony.v1;
+
+// ── Core data model (§6, §7) ────────────────────────────────────────────────
+
+// Hybrid Logical Clock (§7.1). Two explicit fields, never a packed integer.
+message Hlc {
+  uint64 physical = 1; // integer milliseconds since the Unix epoch, UTC
+  uint64 logical  = 2; // monotonic counter; resets to 0 when physical advances
+}
+
+// A versioned store entry (§6.2). Values are opaque bytes; the core never
+// interprets them.
+message Entry {
+  bytes value   = 1; // opaque payload; empty if deleted
+  bool  deleted = 2; // true => tombstone, key reads as absent (§6.3)
+  Hlc   hlc     = 3; // version (§7)
+  bytes writer  = 4; // 16 raw bytes of the originating node id (§8); tie-break
+}
+
+// ── Membership (§9) ─────────────────────────────────────────────────────────
+
+message NodeState {
+  bytes  node_id      = 1; // 16 raw bytes (§8)
+  string typeid_str   = 2; // "node_..." display form
+  string label        = 3; // human label (§8.4), display-only
+  string grpc_address = 4; // host:port for the peer's gRPC server
+  enum Status {
+    ALIVE   = 0;
+    SUSPECT = 1;
+    FAILED  = 2;
+    LEFT    = 3;
+  }
+  Status status      = 5;
+  uint64 incarnation = 6; // §9.4
+}
+
+// ── Envelope (§11.2) ────────────────────────────────────────────────────────
+
+// Carried by every RPC message. Nodes MUST negotiate or cleanly reject
+// incompatible protocol versions rather than silently corrupting state.
+message Header {
+  uint32 protocol_version    = 1; // §11.2
+  repeated NodeState gossip   = 2; // piggybacked membership updates (§9.5)
+}
+
+// ── Membership service (SWIM-style, §9) ─────────────────────────────────────
+
+message PingRequest     { Header header = 1; }
+message PingResponse    { Header header = 1; }
+message PingReqRequest  { Header header = 1; bytes target_node_id = 2; }
+message PingReqResponse { Header header = 1; bool acked = 2; }
+message JoinRequest     { Header header = 1; NodeState self = 2; }
+message JoinResponse    { Header header = 1; repeated NodeState members = 2; }
+
+service Membership {
+  rpc Ping    (PingRequest)    returns (PingResponse);
+  rpc PingReq (PingReqRequest) returns (PingReqResponse);
+  rpc Join    (JoinRequest)    returns (JoinResponse);
+}
+
+// ── Replication service (CRDT engine, §10) ──────────────────────────────────
+
+message DeltaBatch     { Header header = 1; map<string, Entry> entries = 2; }
+message DeltaAck       { Header header = 1; }
+message DigestRequest  { Header header = 1; map<string, Hlc> versions = 2; } // §10.2
+message DigestResponse { Header header = 1; map<string, Entry> entries = 2; } // newer/missing
+
+service Replication {
+  rpc PushDeltas (DeltaBatch)    returns (DeltaAck);       // Path A (§10.1)
+  rpc SyncDigest (DigestRequest) returns (DigestResponse); // Path B (§10.2)
+}
